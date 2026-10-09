@@ -2654,6 +2654,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    # Python 3.12+ va 3.14 da MainThread da avtomatik event loop bo'lmasligi mumkin
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     init_db()
     start_web_server(WEB_PORT)
 
