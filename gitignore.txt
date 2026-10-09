@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Mahalliy ma'lumotlar bazasi (Render ephemeral disk, Telegram backup orqali ishlaydi)
+sarn.db
+*.db-journal
+
+# Mahalliy test va tunnel fayllari
+cloudflared.exe
+tunnel.bat
+web/test_script.js
+
+# Muhit o'zgaruvchilari
+.env
+venv/
+.venv/
