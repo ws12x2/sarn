@@ -1074,6 +1074,23 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self._json_response(200, {"status": "ok", "app": "SARN", "time": datetime.now().isoformat()})
             return
 
+        # === Asosiy sahifa (index.html) ===
+        if parsed.path in ("/", "/index.html"):
+            index_path = os.path.join(WEB_DIR, "index.html")
+            if os.path.exists(index_path):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                with open(index_path, "rb") as f:
+                    content = f.read()
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            else:
+                self.send_error(404, f"index.html topilmadi: {index_path}")
+                return
+
         # === API: Foydalanuvchi profili ===
         if parsed.path == "/api/profile":
             chat_id = params.get("chat_id", [None])[0]
