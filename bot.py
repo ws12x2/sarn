@@ -289,6 +289,48 @@ def init_db():
         )
     """)
 
+    # Battle o'yinlari jadvali
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS battles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE,
+            creator_id INTEGER NOT NULL,
+            max_players INTEGER NOT NULL DEFAULT 2,
+            subject_id INTEGER NOT NULL,
+            question_count INTEGER NOT NULL DEFAULT 5,
+            is_public INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'waiting', -- waiting, active, finished
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (subject_id) REFERENCES subjects(id)
+        )
+    """)
+
+    # Battle ishtirokchilari
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS battle_players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            battle_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            correct_count INTEGER NOT NULL DEFAULT 0,
+            finished INTEGER NOT NULL DEFAULT 0,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(battle_id, chat_id),
+            FOREIGN KEY (battle_id) REFERENCES battles(id)
+        )
+    """)
+
+    # Battle uchun tanlangan savollar
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS battle_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            battle_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            order_num INTEGER NOT NULL,
+            FOREIGN KEY (battle_id) REFERENCES battles(id),
+            FOREIGN KEY (question_id) REFERENCES questions(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -458,6 +500,321 @@ def find_user_by_query(query: str):
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
+
+
+def get_top_users(limit: int = 5):
+    """EXP bo'yicha eng yuqori foydalanuvchilar ro'yxati."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT chat_id, username, full_name, exp, coins, rank, vip_until FROM users ORDER BY exp DESC, coins DESC LIMIT ?",
+        (limit,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        rank_info = calculate_rank(r[3])
+        result.append({
+            "chat_id": r[0],
+            "username": r[1] or "",
+            "full_name": r[2] or "O'quvchi",
+            "exp": r[3],
+            "coins": r[4],
+            "rank": rank_info["rank"],
+            "rank_title": rank_info["title"],
+            "is_vip": is_vip(r[0])
+        })
+    return result
+
+
+def search_users_api(query: str, limit: int = 10):
+    """TG ID yoki username bo'yicha foydalanuvchilarni qidirish."""
+    q = query.strip().lstrip("@")
+    if not q:
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if q.isdigit():
+        cur.execute(
+            "SELECT chat_id, username, full_name, exp, coins, rank, vip_until FROM users WHERE chat_id = ? OR CAST(chat_id AS TEXT) LIKE ? ORDER BY exp DESC LIMIT ?",
+            (int(q), f"%{q}%", limit)
+        )
+    else:
+        cur.execute(
+            "SELECT chat_id, username, full_name, exp, coins, rank, vip_until FROM users WHERE username LIKE ? COLLATE NOCASE OR full_name LIKE ? COLLATE NOCASE ORDER BY exp DESC LIMIT ?",
+            (f"%{q}%", f"%{q}%", limit)
+        )
+    rows = cur.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        rank_info = calculate_rank(r[3])
+        result.append({
+            "chat_id": r[0],
+            "username": r[1] or "",
+            "full_name": r[2] or "O'quvchi",
+            "exp": r[3],
+            "coins": r[4],
+            "rank": rank_info["rank"],
+            "rank_title": rank_info["title"],
+            "is_vip": is_vip(r[0])
+        })
+    return result
+
+
+def generate_battle_code() -> str:
+    """Bosh harf va son kombinatsiyasida 6 belgili unikal kod yaratadi."""
+    import random, string
+    chars = string.ascii_uppercase + string.digits
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for _ in range(50):
+        code = "".join(random.choices(chars, k=6))
+        cur.execute("SELECT id FROM battles WHERE code = ? AND status != 'finished'", (code,))
+        if not cur.fetchone():
+            conn.close()
+            return code
+    conn.close()
+    return "".join(random.choices(chars, k=6))
+
+
+def create_battle(creator_id: int, max_players: int, subject_id: int, question_count: int, is_public: bool) -> dict:
+    """Yangi battle xonasini yaratadi va yaratuvchini o'yinchi sifatida qo'shadi."""
+    code = generate_battle_code()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO battles (code, creator_id, max_players, subject_id, question_count, is_public, status) VALUES (?, ?, ?, ?, ?, ?, 'waiting')",
+        (code, creator_id, max_players, subject_id, question_count, 1 if is_public else 0)
+    )
+    battle_id = cur.lastrowid
+    # Yaratuvchini birinchi o'yinchi sifatida qo'shish
+    cur.execute(
+        "INSERT INTO battle_players (battle_id, chat_id, correct_count, finished) VALUES (?, ?, 0, 0)",
+        (battle_id, creator_id)
+    )
+    # Ushbu fan bo'yicha savollarni tanlab olish
+    cur.execute(
+        "SELECT id FROM questions WHERE subject_id = ? ORDER BY RANDOM() LIMIT ?",
+        (subject_id, question_count)
+    )
+    q_rows = cur.fetchall()
+    # Agar savollar yetarli bo'lmasa, istalgan fandan to'ldirish
+    if len(q_rows) < question_count:
+        needed = question_count - len(q_rows)
+        cur.execute(
+            "SELECT id FROM questions ORDER BY RANDOM() LIMIT ?",
+            (needed,)
+        )
+        q_rows.extend(cur.fetchall())
+
+    for idx, q in enumerate(q_rows):
+        cur.execute(
+            "INSERT INTO battle_questions (battle_id, question_id, order_num) VALUES (?, ?, ?)",
+            (battle_id, q[0], idx + 1)
+        )
+    conn.commit()
+    conn.close()
+    return get_battle_details(battle_id)
+
+
+def get_public_battles() -> list:
+    """Hozir kutish holatidagi ommaviy battle xonalari."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT b.id, b.code, b.creator_id, b.max_players, b.subject_id, b.question_count, b.is_public, b.status, s.name, u.full_name,
+               (SELECT COUNT(*) FROM battle_players WHERE battle_id = b.id) as player_count
+        FROM battles b
+        LEFT JOIN subjects s ON b.subject_id = s.id
+        LEFT JOIN users u ON b.creator_id = u.chat_id
+        WHERE b.status = 'waiting' AND b.is_public = 1
+        ORDER BY b.id DESC LIMIT 20
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    res = []
+    for r in rows:
+        res.append({
+            "id": r[0], "code": r[1], "creator_id": r[2], "max_players": r[3],
+            "subject_id": r[4], "question_count": r[5], "is_public": bool(r[6]),
+            "status": r[7], "subject_name": r[8] or "Umumiy", "creator_name": r[9] or "O'yinchi",
+            "player_count": r[10]
+        })
+    return res
+
+
+def get_battle_details(battle_id_or_code) -> dict:
+    """Battle xonasi tafsilotlari, o'yinchilar ro'yxati va holati."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if isinstance(battle_id_or_code, int) or str(battle_id_or_code).isdigit():
+        cur.execute("""
+            SELECT b.id, b.code, b.creator_id, b.max_players, b.subject_id, b.question_count, b.is_public, b.status, s.name
+            FROM battles b
+            LEFT JOIN subjects s ON b.subject_id = s.id
+            WHERE b.id = ?
+        """, (int(battle_id_or_code),))
+    else:
+        cur.execute("""
+            SELECT b.id, b.code, b.creator_id, b.max_players, b.subject_id, b.question_count, b.is_public, b.status, s.name
+            FROM battles b
+            LEFT JOIN subjects s ON b.subject_id = s.id
+            WHERE b.code = ? COLLATE NOCASE
+        """, (str(battle_id_or_code).strip().upper(),))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    bid = row[0]
+    # O'yinchilar
+    cur.execute("""
+        SELECT bp.chat_id, bp.correct_count, bp.finished, u.full_name, u.username, u.rank
+        FROM battle_players bp
+        LEFT JOIN users u ON bp.chat_id = u.chat_id
+        WHERE bp.battle_id = ?
+        ORDER BY bp.correct_count DESC, bp.id ASC
+    """, (bid,))
+    p_rows = cur.fetchall()
+    players = []
+    for p in p_rows:
+        players.append({
+            "chat_id": p[0], "correct_count": p[1], "finished": bool(p[2]),
+            "full_name": p[3] or "O'quvchi", "username": p[4] or "", "rank": p[5] or "F"
+        })
+    conn.close()
+    return {
+        "id": row[0], "code": row[1], "creator_id": row[2], "max_players": row[3],
+        "subject_id": row[4], "question_count": row[5], "is_public": bool(row[6]),
+        "status": row[7], "subject_name": row[8] or "Umumiy",
+        "players": players, "player_count": len(players)
+    }
+
+
+def join_battle(chat_id: int, code: str) -> dict:
+    """Mavjud battle xonasiga kod orqali qo'shilish."""
+    code_clean = code.strip().upper()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, max_players, status FROM battles WHERE code = ? COLLATE NOCASE", (code_clean,))
+    brow = cur.fetchone()
+    if not brow:
+        conn.close()
+        return {"ok": False, "error": "Battle topilmadi yoki kod noto'g'ri"}
+    battle_id, max_p, status = brow
+    if status != 'waiting':
+        conn.close()
+        return {"ok": False, "error": "Battle allaqachon boshlangan yoki tugatilgan"}
+    # Allaqachon qo'shilganmi?
+    cur.execute("SELECT id FROM battle_players WHERE battle_id = ? AND chat_id = ?", (battle_id, chat_id))
+    if cur.fetchone():
+        conn.close()
+        return {"ok": True, "battle": get_battle_details(battle_id), "already": True}
+    # Joy bormi?
+    cur.execute("SELECT COUNT(*) FROM battle_players WHERE battle_id = ?", (battle_id,))
+    count = cur.fetchone()[0]
+    if count >= max_p:
+        conn.close()
+        return {"ok": False, "error": "Battle xonasi to'lgan"}
+    cur.execute(
+        "INSERT INTO battle_players (battle_id, chat_id, correct_count, finished) VALUES (?, ?, 0, 0)",
+        (battle_id, chat_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "battle": get_battle_details(battle_id)}
+
+
+def start_battle_game(battle_id: int, requester_id: int) -> dict:
+    """Yaratuvchi o'yinni boshlaydi (kamida 2 kishi kerak, kod faolsizlantiriladi)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT creator_id, status FROM battles WHERE id = ?", (battle_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {"ok": False, "error": "Battle topilmadi"}
+    creator_id, status = row
+    if creator_id != requester_id:
+        conn.close()
+        return {"ok": False, "error": "Faqat xona egasi o'yinni boshlashi mumkin"}
+    if status != 'waiting':
+        conn.close()
+        return {"ok": False, "error": "Battle allaqachon boshlangan"}
+    cur.execute("SELECT COUNT(*) FROM battle_players WHERE battle_id = ?", (battle_id,))
+    p_count = cur.fetchone()[0]
+    if p_count < 2:
+        conn.close()
+        return {"ok": False, "error": "O'yinni boshlash uchun kamida 2 ta o'yinchi kerak"}
+    # Kodni faolsizlantirish (None) va statusni active qilish
+    cur.execute("UPDATE battles SET status = 'active', code = NULL WHERE id = ?", (battle_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "battle": get_battle_details(battle_id)}
+
+
+def get_battle_questions(battle_id: int) -> list:
+    """Battle uchun tanlangan savollar ro'yxatini yuklash."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT q.id, q.question, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option, bq.order_num
+        FROM battle_questions bq
+        JOIN questions q ON bq.question_id = q.id
+        WHERE bq.battle_id = ?
+        ORDER BY bq.order_num ASC
+    """, (battle_id,))
+    rows = cur.fetchall()
+    conn.close()
+    res = []
+    for r in rows:
+        res.append({
+            "id": r[0], "question": r[1],
+            "option_a": r[2], "option_b": r[3], "option_c": r[4], "option_d": r[5],
+            "correct_option": r[6], "order_num": r[7]
+        })
+    return res
+
+
+def finish_battle_player(battle_id: int, chat_id: int, correct_count: int) -> dict:
+    """O'yinchi o'z testini tugatganda natijasini saqlash va g'olibga tangalar berish."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE battle_players SET correct_count = ?, finished = 1 WHERE battle_id = ? AND chat_id = ?",
+        (correct_count, battle_id, chat_id)
+    )
+    conn.commit()
+    # Barcha o'yinchilar tugatdimi?
+    cur.execute("SELECT COUNT(*), SUM(finished) FROM battle_players WHERE battle_id = ?", (battle_id,))
+    total_p, fin_p = cur.fetchone()
+    reward_given = False
+    winner_id = None
+    if total_p and fin_p and total_p == fin_p:
+        # Hamma tugatdi, statusni finished qilish
+        cur.execute("SELECT status FROM battles WHERE id = ?", (battle_id,))
+        bstat = cur.fetchone()
+        if bstat and bstat[0] != 'finished':
+            cur.execute("UPDATE battles SET status = 'finished' WHERE id = ?", (battle_id,))
+            # Eng ko'p to'g'ri javob bergan g'olibni topish
+            cur.execute(
+                "SELECT chat_id, correct_count FROM battle_players WHERE battle_id = ? ORDER BY correct_count DESC, id ASC LIMIT 1",
+                (battle_id,)
+            )
+            top_player = cur.fetchone()
+            if top_player and top_player[1] > 0:
+                winner_id = top_player[0]
+                reward_given = True
+            conn.commit()
+    conn.close()
+    if reward_given and winner_id:
+        add_coins(winner_id, total_p)
+    return {
+        "ok": True, "battle": get_battle_details(battle_id),
+        "all_finished": (total_p == fin_p), "winner_id": winner_id,
+        "reward_coins": total_p if reward_given else 0
+    }
 
 
 def get_stats():
@@ -1133,6 +1490,50 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self._json_response(200, get_stats())
             return
 
+        # === API: TOP-5 Foydalanuvchilar (EXP bo'yicha) ===
+        if parsed.path == "/api/top_users":
+            top_list = get_top_users(limit=5)
+            self._json_response(200, top_list)
+            return
+
+        # === API: Foydalanuvchilarni qidirish (ID yoki Username) ===
+        if parsed.path == "/api/search_users":
+            query = params.get("q", [""])[0]
+            results = search_users_api(query, limit=10)
+            self._json_response(200, results)
+            return
+
+        # === API: Ommaviy Battle xonalari ro'yxati ===
+        if parsed.path == "/api/battle_public":
+            battles = get_public_battles()
+            self._json_response(200, battles)
+            return
+
+        # === API: Battle tafsilotlari (id yoki kod bo'yicha) ===
+        if parsed.path == "/api/battle_details":
+            b_id = params.get("battle_id", [None])[0]
+            b_code = params.get("code", [None])[0]
+            arg = b_id if b_id else b_code
+            if not arg:
+                self._json_response(400, {"error": "battle_id or code required"})
+                return
+            b_info = get_battle_details(arg)
+            if b_info:
+                self._json_response(200, b_info)
+            else:
+                self._json_response(404, {"error": "not_found"})
+            return
+
+        # === API: Battle savollarini olish ===
+        if parsed.path == "/api/battle_questions":
+            b_id = params.get("battle_id", [None])[0]
+            if not b_id or not b_id.isdigit():
+                self._json_response(400, {"error": "valid battle_id required"})
+                return
+            questions = get_battle_questions(int(b_id))
+            self._json_response(200, questions)
+            return
+
         # === API: Fanlar va savollar soni ===
         if parsed.path == "/api/subjects":
             subjs = get_all_subjects()
@@ -1362,6 +1763,82 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             conn.commit()
             conn.close()
             self._json_response(200, {"ok": True, "progress": progress, "target": target, "completed": newly_completed, "already": False})
+            return
+
+        # === API: Battle yaratish ===
+        if parsed.path == "/api/battle_create":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+            creator_id = body.get("creator_id")
+            max_players = int(body.get("max_players", 2))
+            subject_id = int(body.get("subject_id", 1))
+            question_count = int(body.get("question_count", 5))
+            is_public = bool(body.get("is_public", True))
+            if not creator_id:
+                self._json_response(400, {"ok": False, "error": "creator_id required"})
+                return
+            b_info = create_battle(int(creator_id), max_players, subject_id, question_count, is_public)
+            self._json_response(200, {"ok": True, "battle": b_info})
+            return
+
+        # === API: Battle ga kod orqali qo'shilish ===
+        if parsed.path == "/api/battle_join":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+            chat_id = body.get("chat_id")
+            code = body.get("code")
+            if not chat_id or not code:
+                self._json_response(400, {"ok": False, "error": "chat_id and code required"})
+                return
+            res = join_battle(int(chat_id), str(code))
+            self._json_response(200 if res.get("ok") else 400, res)
+            return
+
+        # === API: Battle o'yinini boshlash ===
+        if parsed.path == "/api/battle_start":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+            battle_id = body.get("battle_id")
+            requester_id = body.get("requester_id")
+            if not battle_id or not requester_id:
+                self._json_response(400, {"ok": False, "error": "battle_id and requester_id required"})
+                return
+            res = start_battle_game(int(battle_id), int(requester_id))
+            self._json_response(200 if res.get("ok") else 400, res)
+            return
+
+        # === API: Battle o'yinchisi tugatganda natija yuborish ===
+        if parsed.path == "/api/battle_finish":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+            battle_id = body.get("battle_id")
+            chat_id = body.get("chat_id")
+            correct_count = int(body.get("correct_count", 0))
+            if not battle_id or not chat_id:
+                self._json_response(400, {"ok": False, "error": "battle_id and chat_id required"})
+                return
+            res = finish_battle_player(int(battle_id), int(chat_id), correct_count)
+            self._json_response(200, res)
             return
 
         self._json_response(404, {"error": "not_found"})
