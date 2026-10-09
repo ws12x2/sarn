@@ -53,7 +53,11 @@ ADMIN_IDS = [5393636771]
 DB_PATH = os.environ.get("DB_PATH", "sarn.db")
 WEB_PORT = int(os.environ.get("PORT", "8080"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WEB_DIR = os.path.join(BASE_DIR, "web")
+# Agar index.html to'g'ridan-to'g'ri asosiy papkada bo'lsa (GitHub rootda), BASE_DIR ni oladi, aks holda 'web' papkasini
+if os.path.exists(os.path.join(BASE_DIR, "index.html")):
+    WEB_DIR = BASE_DIR
+else:
+    WEB_DIR = os.path.join(BASE_DIR, "web")
 IMAGES_DIR = os.path.join(WEB_DIR, "images")
 
 # Standart Baza guruhi ID (muhit o'zgaruvchisidan ham o'qilishi mumkin)
@@ -1076,8 +1080,14 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
 
         # === Asosiy sahifa (index.html) ===
         if parsed.path in ("/", "/index.html"):
-            index_path = os.path.join(WEB_DIR, "index.html")
-            if os.path.exists(index_path):
+            candidates = [
+                os.path.join(WEB_DIR, "index.html"),
+                os.path.join(BASE_DIR, "index.html"),
+                os.path.join(BASE_DIR, "web", "index.html"),
+                "index.html"
+            ]
+            index_path = next((p for p in candidates if os.path.exists(p)), None)
+            if index_path:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 with open(index_path, "rb") as f:
@@ -1088,7 +1098,7 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(content)
                 return
             else:
-                self.send_error(404, f"index.html topilmadi: {index_path}")
+                self.send_error(404, f"index.html topilmadi: {candidates}")
                 return
 
         # === API: Foydalanuvchi profili ===
