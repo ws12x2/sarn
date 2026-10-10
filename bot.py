@@ -83,6 +83,7 @@ WAITING_BG_PHOTO, WAITING_BG_CODE, WAITING_BG_NAME, WAITING_BG_PRICE = range(7, 
 WAITING_STORAGE_GROUP = 11
 WAITING_DB_UPLOAD, WAITING_DB_UPLOAD_CONFIRM = range(12, 14)
 WAITING_TEST_Q, WAITING_TEST_OPTA, WAITING_TEST_OPTB, WAITING_TEST_OPTC, WAITING_TEST_OPTD, WAITING_TEST_CORRECT, WAITING_TEST_SUBJECT = range(14, 21)
+WAITING_BADGE_PHOTO, WAITING_BADGE_CODE, WAITING_BADGE_NAME, WAITING_BADGE_PRICE = range(21, 25)
 
 
 def is_admin(user_id: int) -> bool:
@@ -213,6 +214,38 @@ def init_db():
             FOREIGN KEY (bg_id) REFERENCES backgrounds(id)
         )
     """)
+
+    # Nishonlar (Badges - 1x1 avatar yonidagi nishonlar)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS badges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            price INTEGER NOT NULL DEFAULT 0,
+            code TEXT UNIQUE,
+            file_id TEXT,
+            storage_chat_id INTEGER,
+            storage_message_id INTEGER,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Foydalanuvchi xarid qilgan nishonlar
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_badges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            badge_id INTEGER NOT NULL,
+            bought_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, badge_id),
+            FOREIGN KEY (badge_id) REFERENCES badges(id)
+        )
+    """)
+
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN active_badge_id INTEGER")
+    except Exception:
+        pass
 
     # Fanlar jadvali
     cur.execute("""
@@ -416,8 +449,11 @@ def get_user_data(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT chat_id, username, full_name, exp, coins, rank, vip_until, streak "
-        "FROM users WHERE chat_id = ?",
+        "SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, u.streak, "
+        "       u.active_badge_id, b.filename, b.name "
+        "FROM users u "
+        "LEFT JOIN badges b ON u.active_badge_id = b.id "
+        "WHERE u.chat_id = ?",
         (chat_id,),
     )
     row = cur.fetchone()
@@ -426,6 +462,9 @@ def get_user_data(chat_id: int):
         return None
     exp = row[3]
     rank_info = calculate_rank(exp)
+    active_badge_id = row[8]
+    badge_filename = row[9]
+    badge_name = row[10] or ""
     return {
         "chat_id": row[0], "username": row[1] or "",
         "full_name": row[2] or "", "exp": exp,
@@ -437,6 +476,9 @@ def get_user_data(chat_id: int):
         "progress_pct": rank_info["progress_pct"],
         "is_vip": is_vip(chat_id),
         "vip_until": row[6], "streak": row[7],
+        "active_badge_id": active_badge_id,
+        "badge_url": f"/images/{badge_filename}" if badge_filename else None,
+        "badge_name": badge_name,
     }
 
 
@@ -516,10 +558,12 @@ def get_top_users(limit: int = 5):
     """EXP bo'yicha eng yuqori foydalanuvchilar ro'yxati."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT chat_id, username, full_name, exp, coins, rank, vip_until FROM users ORDER BY exp DESC, coins DESC LIMIT ?",
-        (limit,)
-    )
+    cur.execute("""
+        SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename
+        FROM users u
+        LEFT JOIN badges b ON u.active_badge_id = b.id
+        ORDER BY u.exp DESC, u.coins DESC LIMIT ?
+    """, (limit,))
     rows = cur.fetchall()
     conn.close()
     result = []
@@ -533,7 +577,8 @@ def get_top_users(limit: int = 5):
             "coins": r[4],
             "rank": rank_info["rank"],
             "rank_title": rank_info["title"],
-            "is_vip": is_vip(r[0])
+            "is_vip": is_vip(r[0]),
+            "badge_url": f"/images/{r[7]}" if r[7] else None
         })
     return result
 
@@ -546,15 +591,21 @@ def search_users_api(query: str, limit: int = 10):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     if q.isdigit():
-        cur.execute(
-            "SELECT chat_id, username, full_name, exp, coins, rank, vip_until FROM users WHERE chat_id = ? OR CAST(chat_id AS TEXT) LIKE ? ORDER BY exp DESC LIMIT ?",
-            (int(q), f"%{q}%", limit)
-        )
+        cur.execute("""
+            SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename
+            FROM users u
+            LEFT JOIN badges b ON u.active_badge_id = b.id
+            WHERE u.chat_id = ? OR CAST(u.chat_id AS TEXT) LIKE ?
+            ORDER BY u.exp DESC LIMIT ?
+        """, (int(q), f"%{q}%", limit))
     else:
-        cur.execute(
-            "SELECT chat_id, username, full_name, exp, coins, rank, vip_until FROM users WHERE username LIKE ? COLLATE NOCASE OR full_name LIKE ? COLLATE NOCASE ORDER BY exp DESC LIMIT ?",
-            (f"%{q}%", f"%{q}%", limit)
-        )
+        cur.execute("""
+            SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename
+            FROM users u
+            LEFT JOIN badges b ON u.active_badge_id = b.id
+            WHERE u.username LIKE ? COLLATE NOCASE OR u.full_name LIKE ? COLLATE NOCASE
+            ORDER BY u.exp DESC LIMIT ?
+        """, (f"%{q}%", f"%{q}%", limit))
     rows = cur.fetchall()
     conn.close()
     result = []
@@ -568,7 +619,8 @@ def search_users_api(query: str, limit: int = 10):
             "coins": r[4],
             "rank": rank_info["rank"],
             "rank_title": rank_info["title"],
-            "is_vip": is_vip(r[0])
+            "is_vip": is_vip(r[0]),
+            "badge_url": f"/images/{r[7]}" if r[7] else None
         })
     return result
 
@@ -680,9 +732,11 @@ def get_battle_details(battle_id_or_code) -> dict:
     bid = row[0]
     # O'yinchilar (tenglik bo'lsa oldin tugatgan o'yinchi balandroq turadi)
     cur.execute("""
-        SELECT bp.chat_id, bp.correct_count, bp.finished, u.full_name, u.username, u.rank, bp.finish_time
+        SELECT bp.chat_id, bp.correct_count, bp.finished, u.full_name, u.username, u.rank, bp.finish_time,
+               b.filename
         FROM battle_players bp
         LEFT JOIN users u ON bp.chat_id = u.chat_id
+        LEFT JOIN badges b ON u.active_badge_id = b.id
         WHERE bp.battle_id = ?
         ORDER BY bp.correct_count DESC, (CASE WHEN bp.finish_time IS NULL THEN 9999999999 ELSE bp.finish_time END) ASC, bp.id ASC
     """, (bid,))
@@ -696,7 +750,8 @@ def get_battle_details(battle_id_or_code) -> dict:
         players.append({
             "chat_id": p[0], "correct_count": p[1], "finished": is_fin,
             "full_name": p[3] or "O'quvchi", "username": p[4] or "", "rank": p[5] or "F",
-            "finish_time": p[6]
+            "finish_time": p[6],
+            "badge_url": f"/images/{p[7]}" if p[7] else None
         })
     conn.close()
     total_players = len(players)
@@ -1075,12 +1130,201 @@ def buy_background(chat_id: int, bg_id: int) -> dict:
     conn.close()
     return {"ok": True, "error": None, "new_coins": new_coins}
 
+# ===== NISHON AMALIYOTLARI (BADGES) =====
+
+def add_badge(name: str, filename: str, price: int, code: str = None, file_id: str = None, storage_chat_id: int = None, storage_message_id: int = None) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO badges (name, filename, price, code, file_id, storage_chat_id, storage_message_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (name, filename, price, code, file_id, storage_chat_id, storage_message_id),
+    )
+    b_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return b_id
+
+
+def get_all_badges():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, filename, price, code, file_id, storage_chat_id, storage_message_id FROM badges ORDER BY id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0], "name": r[1],
+            "filename": r[2], "price": r[3],
+            "code": r[4] or f"{r[0]}badge",
+            "file_id": r[5],
+            "storage_chat_id": r[6],
+            "storage_message_id": r[7],
+            "url": f"/images/{r[2]}",
+        }
+        for r in rows
+    ]
+
+
+def get_badge_by_id(badge_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, filename, price, code, file_id, storage_chat_id, storage_message_id FROM badges WHERE id = ?", (badge_id,))
+    r = cur.fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {
+        "id": r[0], "name": r[1], "filename": r[2], "price": r[3],
+        "code": r[4] or f"{r[0]}badge", "file_id": r[5], "storage_chat_id": r[6], "storage_message_id": r[7],
+        "url": f"/images/{r[2]}"
+    }
+
+
+def get_badge_by_code(code: str):
+    if not code:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, filename, price, code, file_id, storage_chat_id, storage_message_id FROM badges WHERE LOWER(code) = LOWER(?)",
+        (code.strip(),),
+    )
+    r = cur.fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {
+        "id": r[0], "name": r[1], "filename": r[2], "price": r[3],
+        "code": r[4] or f"{r[0]}badge", "file_id": r[5], "storage_chat_id": r[6], "storage_message_id": r[7],
+        "url": f"/images/{r[2]}"
+    }
+
+
+def is_badge_code_taken(code: str) -> bool:
+    if not code:
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM badges WHERE LOWER(code) = LOWER(?)", (code.strip(),))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def delete_badge(badge_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT filename FROM badges WHERE id = ?", (badge_id,))
+    row = cur.fetchone()
+    if row:
+        fpath = os.path.join(IMAGES_DIR, row[0])
+        if os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+    cur.execute("DELETE FROM user_badges WHERE badge_id = ?", (badge_id,))
+    cur.execute("UPDATE users SET active_badge_id = NULL WHERE active_badge_id = ?", (badge_id,))
+    cur.execute("DELETE FROM badges WHERE id = ?", (badge_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_user_owned_badges(chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT b.id, b.name, b.filename, b.price, b.code
+        FROM user_badges ub
+        JOIN badges b ON ub.badge_id = b.id
+        WHERE ub.chat_id = ?
+        ORDER BY ub.bought_at DESC
+    """, (chat_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "name": r[1], "filename": r[2],
+         "price": r[3], "code": r[4] or f"{r[0]}badge", "url": f"/images/{r[2]}"}
+        for r in rows
+    ]
+
+
+def buy_badge(chat_id: int, badge_id: int) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM user_badges WHERE chat_id = ? AND badge_id = ?",
+        (chat_id, badge_id),
+    )
+    if cur.fetchone():
+        conn.close()
+        return {"ok": False, "error": "already_owned"}
+
+    cur.execute("SELECT price FROM badges WHERE id = ?", (badge_id,))
+    brow = cur.fetchone()
+    if not brow:
+        conn.close()
+        return {"ok": False, "error": "not_found"}
+
+    price = brow[0]
+    cur.execute("SELECT coins FROM users WHERE chat_id = ?", (chat_id,))
+    user_row = cur.fetchone()
+    if not user_row or user_row[0] < price:
+        conn.close()
+        return {"ok": False, "error": "not_enough_coins"}
+
+    new_coins = user_row[0] - price
+    cur.execute("UPDATE users SET coins = ? WHERE chat_id = ?", (new_coins, chat_id))
+    cur.execute(
+        "INSERT OR IGNORE INTO user_badges (chat_id, badge_id) VALUES (?, ?)",
+        (chat_id, badge_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "error": None, "new_coins": new_coins}
+
+
+def set_active_badge(chat_id: int, badge_id: int | None) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if badge_id is None or badge_id == 0:
+        cur.execute("UPDATE users SET active_badge_id = NULL WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "active_badge_id": None, "badge_url": None, "badge_name": None}
+
+    # Foydalanuvchi ushbu nishonni sotib olganmi?
+    cur.execute("SELECT id FROM user_badges WHERE chat_id = ? AND badge_id = ?", (chat_id, badge_id))
+    if not cur.fetchone():
+        conn.close()
+        return {"ok": False, "error": "not_owned"}
+
+    cur.execute("SELECT filename, name FROM badges WHERE id = ?", (badge_id,))
+    brow = cur.fetchone()
+    if not brow:
+        conn.close()
+        return {"ok": False, "error": "badge_not_found"}
+
+    cur.execute("UPDATE users SET active_badge_id = ? WHERE chat_id = ?", (badge_id, chat_id))
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "active_badge_id": badge_id,
+        "badge_url": f"/images/{brow[0]}",
+        "badge_name": brow[1]
+    }
+
 
 def restore_image_from_telegram(filename: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT file_id FROM backgrounds WHERE filename = ?", (filename,))
     row = cur.fetchone()
+    if not row or not row[0]:
+        cur.execute("SELECT file_id FROM badges WHERE filename = ?", (filename,))
+        row = cur.fetchone()
     conn.close()
     if not row or not row[0]:
         return False
@@ -1562,6 +1806,22 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self._json_response(400, {"error": "chat_id required"})
             return
 
+        # === API: Barcha nishonlar ===
+        if parsed.path == "/api/badges":
+            b_list = get_all_badges()
+            self._json_response(200, b_list)
+            return
+
+        # === API: Mening xarid qilgan nishonlarim ===
+        if parsed.path == "/api/my_badges":
+            chat_id = params.get("chat_id", [None])[0]
+            if chat_id and chat_id.lstrip("-").isdigit():
+                owned = get_user_owned_badges(int(chat_id))
+                self._json_response(200, owned)
+                return
+            self._json_response(400, {"error": "chat_id required"})
+            return
+
         # === API: Statistika ===
         if parsed.path == "/api/stats":
             self._json_response(200, get_stats())
@@ -1772,6 +2032,53 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
 
             result = buy_background(int(chat_id), int(bg_id))
             self._json_response(200, result)
+            return
+
+        # === API: Nishon sotib olish ===
+        if parsed.path == "/api/buy_badge":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+
+            chat_id = body.get("chat_id")
+            badge_id = body.get("badge_id")
+            if not chat_id or not badge_id:
+                self._json_response(400, {"ok": False, "error": "missing_params"})
+                return
+
+            result = buy_badge(int(chat_id), int(badge_id))
+            self._json_response(200, result)
+            return
+
+        # === API: Faol nishonni o'rnatish yoki olib tashlash ===
+        if parsed.path == "/api/set_badge":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+
+            chat_id = body.get("chat_id")
+            badge_id = body.get("badge_id")
+            if not chat_id:
+                self._json_response(400, {"ok": False, "error": "missing_chat_id"})
+                return
+
+            val = None
+            if badge_id is not None and str(badge_id).lower() not in ("0", "none", "null", ""):
+                try:
+                    val = int(badge_id)
+                except ValueError:
+                    val = None
+
+            result = set_active_badge(int(chat_id), val)
+            self._json_response(200 if result.get("ok") else 400, result)
             return
 
         # === API: Xonada javob berish ===
@@ -2035,6 +2342,10 @@ def build_admin_main_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🖼 Fon Qo'shish", callback_data="adm_add_bg"),
             InlineKeyboardButton("🗑 Fonlarni Ko'rish", callback_data="adm_list_bg"),
+        ],
+        [
+            InlineKeyboardButton("🎖 Nishon Qo'shish", callback_data="adm_add_badge"),
+            InlineKeyboardButton("🎖 Nishonlar Ro'yxati", callback_data="adm_list_badge"),
         ],
         [
             InlineKeyboardButton("📁 Baza Guruhi", callback_data="adm_storage_group"),
@@ -2351,6 +2662,55 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons.append([
                 InlineKeyboardButton(f"👁 {bg['name']}", callback_data=f"adm_view_bg_{bg['id']}"),
                 InlineKeyboardButton(f"🗑 O'chirish", callback_data=f"adm_del_bg_{bg['id']}"),
+            ])
+        buttons.append([InlineKeyboardButton("◀️ Orqaga", callback_data="adm_back")])
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data == "adm_list_badge":
+        badges = get_all_badges()
+        if not badges:
+            await query.edit_message_text(
+                "🎖 Hozircha do'konda hech qanday nishon yo'q.\n«🎖 Nishon Qo'shish» tugmasi orqali nishon qo'shing.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Orqaga", callback_data="adm_back")]]),
+            )
+            return
+        lines = ["🎖 <b>Do'kondagi Nishonlar (1x1):</b>\n"]
+        buttons = []
+        for b in badges:
+            code_str = b.get('code') or f"{b['id']}badge"
+            lines.append(f"• <b>[{code_str}] {b['name']}</b> — {b['price']} Coin (ID: {b['id']})")
+            buttons.append([
+                InlineKeyboardButton(f"🗑 {b['name']} o'chirish", callback_data=f"adm_del_badge_{b['id']}"),
+            ])
+        buttons.append([InlineKeyboardButton("◀️ Orqaga", callback_data="adm_back")])
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("adm_del_badge_"):
+        b_id = int(data.split("_")[-1])
+        delete_badge(b_id)
+        await query.answer("✅ Nishon o'chirildi!", show_alert=True)
+        badges = get_all_badges()
+        if not badges:
+            await query.edit_message_text(
+                "🎖 Hozircha do'konda nishonlar qolmadi.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Orqaga", callback_data="adm_back")]]),
+            )
+            return
+        lines = ["🎖 <b>Do'kondagi Nishonlar:</b>\n"]
+        buttons = []
+        for b in badges:
+            code_str = b.get('code') or f"{b['id']}badge"
+            lines.append(f"• <b>[{code_str}] {b['name']}</b> — {b['price']} Coin (ID: {b['id']})")
+            buttons.append([
+                InlineKeyboardButton(f"🗑 {b['name']} o'chirish", callback_data=f"adm_del_badge_{b['id']}"),
             ])
         buttons.append([InlineKeyboardButton("◀️ Orqaga", callback_data="adm_back")])
         await query.edit_message_text(
@@ -2697,6 +3057,158 @@ async def adm_add_bg_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+
+
+# ========== NISHON QO'SHISH OQIMI (Admin) ==========
+
+async def adm_add_badge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_html(
+        "🎖 <b>Yangi 1x1 Nishon Qo'shish</b>\n\n"
+        "1-qadam: Nishon rasmini yuboring (kvadrat 1x1 nisbatda, jpg, png yoki svg):\n"
+        "<i>(Bekor qilish uchun /cancel)</i>"
+    )
+    return WAITING_BADGE_PHOTO
+
+
+async def adm_add_badge_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo and not update.message.document:
+        await update.message.reply_text("⚠️ Iltimos, 1x1 rasm yuboring (jpg, png yoki svg):")
+        return WAITING_BADGE_PHOTO
+
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+        file_id = update.message.photo[-1].file_id
+        ext = "jpg"
+    else:
+        doc = update.message.document
+        if not doc.mime_type or not any(x in doc.mime_type.lower() for x in ("image", "svg")):
+            await update.message.reply_text("⚠️ Faqat rasm (image/svg) yuboring:")
+            return WAITING_BADGE_PHOTO
+        photo_file = await doc.get_file()
+        file_id = doc.file_id
+        ext = doc.file_name.split(".")[-1] if "." in (doc.file_name or "") else "png"
+
+    temp_filename = f"temp_badge_{update.effective_user.id}_{int(time.time())}.{ext}"
+    temp_path = os.path.join(IMAGES_DIR, temp_filename)
+    await photo_file.download_to_drive(custom_path=temp_path)
+
+    context.user_data["badge_pending_file"] = temp_path
+    context.user_data["badge_pending_ext"] = ext
+    context.user_data["badge_pending_file_id"] = file_id
+    context.user_data["badge_pending_msg_id"] = update.message.message_id
+    context.user_data["badge_pending_chat_id"] = update.effective_chat.id
+
+    await update.message.reply_html(
+        "✅ Rasm qabul qilindi!\n\n"
+        "2-qadam: Nishon uchun <b>unikal qisqa kod</b> kiriting (faqat harflar/sonlar, masalan: <code>star</code>, <code>crown</code>, <code>fire</code>):"
+    )
+    return WAITING_BADGE_CODE
+
+
+async def adm_add_badge_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip().lower()
+    if not code.isalnum() or len(code) < 2 or len(code) > 20:
+        await update.message.reply_html("⚠️ Kod faqat 2-20 ta lotin harfi yoki sonlardan iborat bo'lsin. Qayta kiriting:")
+        return WAITING_BADGE_CODE
+
+    if is_badge_code_taken(code):
+        await update.message.reply_html(f"⚠️ <code>{code}</code> kodi allaqachon mavjud! Boshqa kod kiriting:")
+        return WAITING_BADGE_CODE
+
+    context.user_data["badge_pending_code"] = code
+    await update.message.reply_html(
+        f"✅ Kod: <code>{code}</code>\n\n"
+        f"3-qadam: Nishon <b>nomini</b> kiriting (masalan: <i>Oltin Yulduz</i>):"
+    )
+    return WAITING_BADGE_NAME
+
+
+async def adm_add_badge_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if len(name) < 2 or len(name) > 60:
+        await update.message.reply_text("⚠️ Nom 2-60 ta belgi oralig'ida bo'lsin:")
+        return WAITING_BADGE_NAME
+
+    context.user_data["badge_pending_name"] = name
+    await update.message.reply_html(
+        f"✅ Nomi: <b>{name}</b>\n\n"
+        f"4-qadam: Nishon <b>narxini</b> kiriting (Coin tangalarida, masalan: <code>50</code>):"
+    )
+    return WAITING_BADGE_PRICE
+
+
+async def adm_add_badge_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 0:
+        await update.message.reply_text("⚠️ Narxni musbat son bilan kiriting (masalan: 50):")
+        return WAITING_BADGE_PRICE
+
+    price = int(text)
+    name = context.user_data.get("badge_pending_name", "Nishon")
+    code = context.user_data.get("badge_pending_code", "badge")
+    ext = context.user_data.get("badge_pending_ext", "png")
+    temp_path = context.user_data.get("badge_pending_file")
+    file_id = context.user_data.get("badge_pending_file_id", "")
+    from_msg_id = context.user_data.get("badge_pending_msg_id")
+    from_chat_id = context.user_data.get("badge_pending_chat_id")
+
+    filename = f"badge_{code}.{ext}"
+    final_path = os.path.join(IMAGES_DIR, filename)
+    if temp_path and os.path.exists(temp_path):
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            os.replace(temp_path, final_path)
+            root_img_path = os.path.join(BASE_DIR, "images", filename)
+            shutil.copyfile(final_path, root_img_path)
+        except Exception as e:
+            logger.warning("Faylni ko'chirishda xatolik: %s", e)
+
+    storage_chat_id = get_storage_chat_id()
+    storage_message_id = None
+    storage_notice = ""
+
+    if storage_chat_id and from_msg_id:
+        try:
+            stored_msg = await context.bot.copy_message(
+                chat_id=storage_chat_id,
+                from_chat_id=from_chat_id,
+                message_id=from_msg_id,
+                caption=f"🎖 <b>SARN Nishon Ombori (1x1)</b>\n"
+                        f"🔑 <b>Kod:</b> <code>{code}</code>\n"
+                        f"🏷 <b>Nomi:</b> <b>{name}</b>\n"
+                        f"🪙 <b>Narxi:</b> {price} Coin\n"
+                        f"📅 <b>Sana:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                parse_mode="HTML",
+            )
+            storage_message_id = stored_msg.message_id
+            storage_notice = f"\n📁 <i>Rasm Baza Guruhiga ({storage_chat_id}) nusxalandi!</i>"
+        except Exception as e:
+            logger.warning(f"Baza guruhiga nusxalab bo'lmadi: {e}")
+
+    badge_id = add_badge(
+        name=name,
+        filename=filename,
+        price=price,
+        code=code,
+        file_id=file_id,
+        storage_chat_id=storage_chat_id,
+        storage_message_id=storage_message_id,
+    )
+
+    await update.message.reply_html(
+        f"🎉 <b>Yangi 1x1 Nishon muvaffaqiyatli qo'shildi!</b>\n\n"
+        f"🔑 <b>Kodi:</b> <code>{code}</code>\n"
+        f"🎖 <b>Nomi:</b> <b>{name}</b>\n"
+        f"🪙 <b>Narxi:</b> <b>{price} Coin</b>\n"
+        f"🆔 <b>ID:</b> <code>{badge_id}</code>"
+        f"{storage_notice}\n\n"
+        f"Nishon endi do'konda sotuvga chiqdi!",
+        reply_markup=build_admin_main_keyboard(),
+    )
+    return ConversationHandler.END
 
 # ========== VIP BERISH ==========
 
@@ -3399,6 +3911,25 @@ def main():
     # Handlerlarni ro'yxatga olish
     app.add_handler(storage_conv)
     app.add_handler(db_upload_conv)
+    badge_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(adm_add_badge_start, pattern=r"^adm_add_badge$")],
+        states={
+            WAITING_BADGE_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, adm_add_badge_photo),
+            ],
+            WAITING_BADGE_CODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_badge_code),
+            ],
+            WAITING_BADGE_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_badge_name),
+            ],
+            WAITING_BADGE_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_badge_price),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_flow)],
+    )
+    app.add_handler(badge_conv)
     app.add_handler(bg_conv)
     app.add_handler(test_conv)
     app.add_handler(vip_conv)
