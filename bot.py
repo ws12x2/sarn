@@ -22,6 +22,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -330,6 +331,15 @@ def init_db():
             FOREIGN KEY (question_id) REFERENCES questions(id)
         )
     """)
+
+    try:
+        cur.execute("ALTER TABLE battle_players ADD COLUMN finish_time REAL")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE battle_players ADD COLUMN finished_at TIMESTAMP")
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -668,27 +678,36 @@ def get_battle_details(battle_id_or_code) -> dict:
         conn.close()
         return None
     bid = row[0]
-    # O'yinchilar
+    # O'yinchilar (tenglik bo'lsa oldin tugatgan o'yinchi balandroq turadi)
     cur.execute("""
-        SELECT bp.chat_id, bp.correct_count, bp.finished, u.full_name, u.username, u.rank
+        SELECT bp.chat_id, bp.correct_count, bp.finished, u.full_name, u.username, u.rank, bp.finish_time
         FROM battle_players bp
         LEFT JOIN users u ON bp.chat_id = u.chat_id
         WHERE bp.battle_id = ?
-        ORDER BY bp.correct_count DESC, bp.id ASC
+        ORDER BY bp.correct_count DESC, (CASE WHEN bp.finish_time IS NULL THEN 9999999999 ELSE bp.finish_time END) ASC, bp.id ASC
     """, (bid,))
     p_rows = cur.fetchall()
     players = []
+    finished_count = 0
     for p in p_rows:
+        is_fin = bool(p[2])
+        if is_fin:
+            finished_count += 1
         players.append({
-            "chat_id": p[0], "correct_count": p[1], "finished": bool(p[2]),
-            "full_name": p[3] or "O'quvchi", "username": p[4] or "", "rank": p[5] or "F"
+            "chat_id": p[0], "correct_count": p[1], "finished": is_fin,
+            "full_name": p[3] or "O'quvchi", "username": p[4] or "", "rank": p[5] or "F",
+            "finish_time": p[6]
         })
     conn.close()
+    total_players = len(players)
+    all_finished = (total_players > 0 and finished_count == total_players)
     return {
         "id": row[0], "code": row[1], "creator_id": row[2], "max_players": row[3],
         "subject_id": row[4], "question_count": row[5], "is_public": bool(row[6]),
         "status": row[7], "subject_name": row[8] or "Umumiy",
-        "players": players, "player_count": len(players)
+        "players": players, "player_count": total_players,
+        "finished_count": finished_count,
+        "all_finished": all_finished
     }
 
 
@@ -754,6 +773,53 @@ def start_battle_game(battle_id: int, requester_id: int) -> dict:
     return {"ok": True, "battle": get_battle_details(battle_id)}
 
 
+def cancel_battle(battle_id: int, creator_id: int) -> dict:
+    """Xona yaratuvchisi kutilayotgan battleni bekor qiladi."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT creator_id, status FROM battles WHERE id = ?", (battle_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {"ok": False, "error": "Battle topilmadi"}
+    c_id, status = row
+    if c_id != creator_id:
+        conn.close()
+        return {"ok": False, "error": "Faqat xona yaratuvchisi bekor qilishi mumkin"}
+    if status != 'waiting':
+        conn.close()
+        return {"ok": False, "error": "Faqat kutilayotgan battle bekor qilinishi mumkin"}
+    cur.execute("UPDATE battles SET status = 'cancelled' WHERE id = ?", (battle_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "message": "Battle bekor qilindi"}
+
+
+def leave_battle(battle_id: int, chat_id: int) -> dict:
+    """O'yinchi kutilayotgan xonadan chiqishi (yaratuvchi chiqsa xona bekor bo'ladi)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT creator_id, status FROM battles WHERE id = ?", (battle_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {"ok": False, "error": "Battle topilmadi"}
+    creator_id, status = row
+    if status != 'waiting':
+        conn.close()
+        return {"ok": False, "error": "Boshlangan yoki tugagan battleni tark etib bo'lmaydi"}
+    if chat_id == creator_id:
+        cur.execute("UPDATE battles SET status = 'cancelled' WHERE id = ?", (battle_id,))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "cancelled": True, "message": "Xona egasi chiqqani uchun battle bekor qilindi"}
+    else:
+        cur.execute("DELETE FROM battle_players WHERE battle_id = ? AND chat_id = ?", (battle_id, chat_id))
+        conn.commit()
+        conn.close()
+        return {"ok": True, "cancelled": False, "message": "Xonadan chiqildi"}
+
+
 def get_battle_questions(battle_id: int) -> list:
     """Battle uchun tanlangan savollar ro'yxatini yuklash."""
     conn = sqlite3.connect(DB_PATH)
@@ -781,9 +847,10 @@ def finish_battle_player(battle_id: int, chat_id: int, correct_count: int) -> di
     """O'yinchi o'z testini tugatganda natijasini saqlash va g'olibga tangalar berish."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    now_ts = time.time()
     cur.execute(
-        "UPDATE battle_players SET correct_count = ?, finished = 1 WHERE battle_id = ? AND chat_id = ?",
-        (correct_count, battle_id, chat_id)
+        "UPDATE battle_players SET correct_count = ?, finished = 1, finish_time = ?, finished_at = CURRENT_TIMESTAMP WHERE battle_id = ? AND chat_id = ?",
+        (correct_count, now_ts, battle_id, chat_id)
     )
     conn.commit()
     # Barcha o'yinchilar tugatdimi?
@@ -791,15 +858,16 @@ def finish_battle_player(battle_id: int, chat_id: int, correct_count: int) -> di
     total_p, fin_p = cur.fetchone()
     reward_given = False
     winner_id = None
-    if total_p and fin_p and total_p == fin_p:
+    all_finished = bool(total_p and fin_p and total_p == fin_p)
+    if all_finished:
         # Hamma tugatdi, statusni finished qilish
         cur.execute("SELECT status FROM battles WHERE id = ?", (battle_id,))
         bstat = cur.fetchone()
         if bstat and bstat[0] != 'finished':
             cur.execute("UPDATE battles SET status = 'finished' WHERE id = ?", (battle_id,))
-            # Eng ko'p to'g'ri javob bergan g'olibni topish
+            # Eng ko'p to'g'ri javob bergan g'olibni topish (tenglikda: oldin yakunlagan o'yinchi yutadi)
             cur.execute(
-                "SELECT chat_id, correct_count FROM battle_players WHERE battle_id = ? ORDER BY correct_count DESC, id ASC LIMIT 1",
+                "SELECT chat_id, correct_count FROM battle_players WHERE battle_id = ? ORDER BY correct_count DESC, (CASE WHEN finish_time IS NULL THEN 9999999999 ELSE finish_time END) ASC, id ASC LIMIT 1",
                 (battle_id,)
             )
             top_player = cur.fetchone()
@@ -807,12 +875,21 @@ def finish_battle_player(battle_id: int, chat_id: int, correct_count: int) -> di
                 winner_id = top_player[0]
                 reward_given = True
             conn.commit()
+        else:
+            cur.execute(
+                "SELECT chat_id, correct_count FROM battle_players WHERE battle_id = ? ORDER BY correct_count DESC, (CASE WHEN finish_time IS NULL THEN 9999999999 ELSE finish_time END) ASC, id ASC LIMIT 1",
+                (battle_id,)
+            )
+            top_player = cur.fetchone()
+            if top_player and top_player[1] > 0:
+                winner_id = top_player[0]
     conn.close()
     if reward_given and winner_id:
         add_coins(winner_id, total_p)
+    b_details = get_battle_details(battle_id)
     return {
-        "ok": True, "battle": get_battle_details(battle_id),
-        "all_finished": (total_p == fin_p), "winner_id": winner_id,
+        "ok": True, "battle": b_details,
+        "all_finished": all_finished, "winner_id": winner_id,
         "reward_coins": total_p if reward_given else 0
     }
 
@@ -1819,6 +1896,42 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
                 self._json_response(400, {"ok": False, "error": "battle_id and requester_id required"})
                 return
             res = start_battle_game(int(battle_id), int(requester_id))
+            self._json_response(200 if res.get("ok") else 400, res)
+            return
+
+        # === API: Battle bekor qilish ===
+        if parsed.path == "/api/battle_cancel":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+            battle_id = body.get("battle_id")
+            creator_id = body.get("creator_id")
+            if not battle_id or not creator_id:
+                self._json_response(400, {"ok": False, "error": "battle_id and creator_id required"})
+                return
+            res = cancel_battle(int(battle_id), int(creator_id))
+            self._json_response(200 if res.get("ok") else 400, res)
+            return
+
+        # === API: Battle xonasidan chiqish ===
+        if parsed.path == "/api/battle_leave":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_len:
+                try:
+                    body = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                except Exception:
+                    pass
+            battle_id = body.get("battle_id")
+            chat_id = body.get("chat_id")
+            if not battle_id or not chat_id:
+                self._json_response(400, {"ok": False, "error": "battle_id and chat_id required"})
+                return
+            res = leave_battle(int(battle_id), int(chat_id))
             self._json_response(200 if res.get("ok") else 400, res)
             return
 
