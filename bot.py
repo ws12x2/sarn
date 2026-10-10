@@ -246,6 +246,10 @@ def init_db():
         cur.execute("ALTER TABLE users ADD COLUMN active_badge_id INTEGER")
     except Exception:
         pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN photo_url TEXT")
+    except Exception:
+        pass
 
     # Fanlar jadvali
     cur.execute("""
@@ -374,6 +378,18 @@ def init_db():
     except Exception:
         pass
 
+    # Foydalanuvchi to'g'ri javob bergan savollar (bir martalik mukofot uchun)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_correct_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, question_id),
+            FOREIGN KEY (question_id) REFERENCES questions(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -419,25 +435,31 @@ def _count_users_in_db() -> int:
         return 0
 
 
-def get_or_create_user(chat_id: int, username: str = None, full_name: str = None):
+def get_or_create_user(chat_id: int, username: str = None, full_name: str = None, photo_url: str = None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
     if not row:
         cur.execute(
-            "INSERT INTO users (chat_id, username, full_name, exp, coins, rank) "
-            "VALUES (?, ?, ?, 0, 0, 'F')",
-            (chat_id, username, full_name),
+            "INSERT INTO users (chat_id, username, full_name, photo_url, exp, coins, rank) "
+            "VALUES (?, ?, ?, ?, 0, 0, 'F')",
+            (chat_id, username, full_name, photo_url),
         )
         conn.commit()
         cur.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
         row = cur.fetchone()
     else:
-        cur.execute(
-            "UPDATE users SET username=?, full_name=?, last_seen=CURRENT_TIMESTAMP WHERE chat_id=?",
-            (username, full_name, chat_id),
-        )
+        if photo_url:
+            cur.execute(
+                "UPDATE users SET username=COALESCE(?, username), full_name=COALESCE(?, full_name), photo_url=?, last_seen=CURRENT_TIMESTAMP WHERE chat_id=?",
+                (username, full_name, photo_url, chat_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET username=COALESCE(?, username), full_name=COALESCE(?, full_name), last_seen=CURRENT_TIMESTAMP WHERE chat_id=?",
+                (username, full_name, chat_id),
+            )
         conn.commit()
     cur.execute("INSERT INTO activity (chat_id) VALUES (?)", (chat_id,))
     conn.commit()
@@ -450,7 +472,7 @@ def get_user_data(chat_id: int):
     cur = conn.cursor()
     cur.execute(
         "SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, u.streak, "
-        "       u.active_badge_id, b.filename, b.name "
+        "       u.active_badge_id, b.filename, b.name, u.photo_url "
         "FROM users u "
         "LEFT JOIN badges b ON u.active_badge_id = b.id "
         "WHERE u.chat_id = ?",
@@ -465,6 +487,7 @@ def get_user_data(chat_id: int):
     active_badge_id = row[8]
     badge_filename = row[9]
     badge_name = row[10] or ""
+    photo_url = row[11] or None
     return {
         "chat_id": row[0], "username": row[1] or "",
         "full_name": row[2] or "", "exp": exp,
@@ -479,7 +502,9 @@ def get_user_data(chat_id: int):
         "active_badge_id": active_badge_id,
         "badge_url": f"/images/{badge_filename}" if badge_filename else None,
         "badge_name": badge_name,
+        "photo_url": photo_url,
     }
+
 
 
 def is_vip(chat_id: int) -> bool:
@@ -559,7 +584,7 @@ def get_top_users(limit: int = 5):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename
+        SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename, u.photo_url
         FROM users u
         LEFT JOIN badges b ON u.active_badge_id = b.id
         ORDER BY u.exp DESC, u.coins DESC LIMIT ?
@@ -578,7 +603,8 @@ def get_top_users(limit: int = 5):
             "rank": rank_info["rank"],
             "rank_title": rank_info["title"],
             "is_vip": is_vip(r[0]),
-            "badge_url": f"/images/{r[7]}" if r[7] else None
+            "badge_url": f"/images/{r[7]}" if r[7] else None,
+            "photo_url": r[8] or None
         })
     return result
 
@@ -592,7 +618,7 @@ def search_users_api(query: str, limit: int = 10):
     cur = conn.cursor()
     if q.isdigit():
         cur.execute("""
-            SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename
+            SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename, u.photo_url
             FROM users u
             LEFT JOIN badges b ON u.active_badge_id = b.id
             WHERE u.chat_id = ? OR CAST(u.chat_id AS TEXT) LIKE ?
@@ -600,7 +626,7 @@ def search_users_api(query: str, limit: int = 10):
         """, (int(q), f"%{q}%", limit))
     else:
         cur.execute("""
-            SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename
+            SELECT u.chat_id, u.username, u.full_name, u.exp, u.coins, u.rank, u.vip_until, b.filename, u.photo_url
             FROM users u
             LEFT JOIN badges b ON u.active_badge_id = b.id
             WHERE u.username LIKE ? COLLATE NOCASE OR u.full_name LIKE ? COLLATE NOCASE
@@ -620,9 +646,11 @@ def search_users_api(query: str, limit: int = 10):
             "rank": rank_info["rank"],
             "rank_title": rank_info["title"],
             "is_vip": is_vip(r[0]),
-            "badge_url": f"/images/{r[7]}" if r[7] else None
+            "badge_url": f"/images/{r[7]}" if r[7] else None,
+            "photo_url": r[8] or None
         })
     return result
+
 
 
 def generate_battle_code() -> str:
@@ -733,7 +761,7 @@ def get_battle_details(battle_id_or_code) -> dict:
     # O'yinchilar (tenglik bo'lsa oldin tugatgan o'yinchi balandroq turadi)
     cur.execute("""
         SELECT bp.chat_id, bp.correct_count, bp.finished, u.full_name, u.username, u.rank, bp.finish_time,
-               b.filename
+               b.filename, u.photo_url
         FROM battle_players bp
         LEFT JOIN users u ON bp.chat_id = u.chat_id
         LEFT JOIN badges b ON u.active_badge_id = b.id
@@ -751,9 +779,11 @@ def get_battle_details(battle_id_or_code) -> dict:
             "chat_id": p[0], "correct_count": p[1], "finished": is_fin,
             "full_name": p[3] or "O'quvchi", "username": p[4] or "", "rank": p[5] or "F",
             "finish_time": p[6],
-            "badge_url": f"/images/{p[7]}" if p[7] else None
+            "badge_url": f"/images/{p[7]}" if p[7] else None,
+            "photo_url": p[8] or None
         })
     conn.close()
+
     total_players = len(players)
     all_finished = (total_players > 0 and finished_count == total_players)
     return {
@@ -1396,6 +1426,65 @@ def add_question(subject_id: int, question: str, opt_a: str, opt_b: str, opt_c: 
     return qid
 
 
+def get_subject_questions_preview(subject_identifier, chat_id: int = None):
+    """Fandagi barcha savollar ro'yxatini preview ko'rinishida (3 ta so'z + ..., daraja, ishlanganlik holati) qaytaradi."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if str(subject_identifier).isdigit():
+        cur.execute("SELECT id, name, icon FROM subjects WHERE id = ?", (int(subject_identifier),))
+    else:
+        cur.execute("SELECT id, name, icon FROM subjects WHERE name = ? OR slug = ?", (str(subject_identifier), str(subject_identifier)))
+    subj = cur.fetchone()
+    if not subj:
+        conn.close()
+        return None
+
+    subj_id, subj_name, subj_icon = subj
+
+    cur.execute("""
+        SELECT id, question, difficulty_level 
+        FROM questions 
+        WHERE subject_id = ? 
+        ORDER BY id ASC
+    """, (subj_id,))
+    rows = cur.fetchall()
+
+    answered_ids = set()
+    if chat_id:
+        cur.execute("SELECT question_id FROM user_correct_answers WHERE chat_id = ?", (chat_id,))
+        answered_ids = {r[0] for r in cur.fetchall()}
+
+    conn.close()
+
+    question_list = []
+    for r in rows:
+        qid = r[0]
+        qtext = (r[1] or "").strip()
+        words = qtext.split()
+        if len(words) > 3:
+            preview_text = " ".join(words[:3]) + "..."
+        else:
+            preview_text = (qtext + "...") if qtext else "..."
+
+        diff = r[2] or "F"
+        is_ans = qid in answered_ids
+
+        question_list.append({
+            "id": qid,
+            "preview": preview_text,
+            "difficulty_level": diff,
+            "is_answered": is_ans
+        })
+
+    return {
+        "subject_id": subj_id,
+        "subject_name": subj_name,
+        "subject_icon": subj_icon,
+        "total_count": len(question_list),
+        "questions": question_list
+    }
+
+
 def get_subject_question_count(subject_id: int) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -1406,20 +1495,21 @@ def get_subject_question_count(subject_id: int) -> int:
 
 
 def get_random_question(subject_id: int, difficulty_level: str = None):
-    """Fan va qiyinlik darajasiga mos random savol qaytaradi."""
+    """Fan va qiyinlik darajasiga mos random savol qaytaradi.
+    Agar difficulty_level berilsa, FAQAT shu darajadagi savollardan tanlanadi.
+    Tasodifiy xona uchun difficulty_level=None berilishi kerak."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     r = None
-    if difficulty_level:
+    if difficulty_level and difficulty_level != 'Random':
         cur.execute("""
             SELECT id, subject_id, question, option_a, option_b, option_c, option_d, correct_option, difficulty_level
             FROM questions WHERE subject_id = ? AND difficulty_level = ?
             ORDER BY RANDOM() LIMIT 1
         """, (subject_id, difficulty_level))
         r = cur.fetchone()
-
-    # Agar ayni shu qiyinlikda topilmasa, fanning istalgan savolini olish
-    if not r:
+    else:
+        # Tasodifiy xona: istalgan darajadagi savol
         cur.execute("""
             SELECT id, subject_id, question, option_a, option_b, option_c, option_d, correct_option, difficulty_level
             FROM questions WHERE subject_id = ?
@@ -1435,6 +1525,7 @@ def get_random_question(subject_id: int, difficulty_level: str = None):
         "option_a": r[3], "option_b": r[4], "option_c": r[5], "option_d": r[6],
         "correct_option": r[7], "difficulty_level": r[8] or "F",
     }
+
 
 
 def update_question_difficulty(question_id: int, new_level: str):
@@ -1509,13 +1600,13 @@ def generate_daily_missions():
 
 
 def process_room_answer(chat_id: int, question_id: int, selected_option: str, room_level: str) -> dict:
-    """Xonada javob berilganda: to'g'ri/noto'g'ri tekshirib, EXP/Coin beradi va qiyinlik yangilaydi."""
+    """Xonada javob berilganda: to'g'ri/noto'g'ri tekshirib, EXP beradi (faqat 1 marta) va qiyinlik yangilaydi."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT correct_option, difficulty_level, question FROM questions WHERE id = ?", (question_id,))
     row = cur.fetchone()
-    conn.close()
     if not row:
+        conn.close()
         return {"ok": False, "error": "question_not_found"}
 
     correct_opt = row[0].upper()
@@ -1526,28 +1617,36 @@ def process_room_answer(chat_id: int, question_id: int, selected_option: str, ro
 
     exp_change = 0
     coin_change = 0
+    already_rewarded = False
 
     if is_correct:
-        exp_change = rewards['exp_correct']
-        coin_change = rewards['coins_correct']
-        # Tasodifiy xonada EXP 2x, hech qanday tanga berilmaydi
-        if room_level == 'Random':
-            exp_change = exp_change * 2
-        add_exp(chat_id, exp_change)
-        # Xonalardan tanga berilmaydi
+        # Tekshirish: foydalanuvchi bu savolga oldin to'g'ri javob berganmi?
+        cur.execute("SELECT id FROM user_correct_answers WHERE chat_id = ? AND question_id = ?", (chat_id, question_id))
+        prev_ans = cur.fetchone()
+        if prev_ans:
+            already_rewarded = True
+            exp_change = 0
+        else:
+            # Birinchi marta to'g'ri javob: bazaga yozish va mukofot berish
+            cur.execute("INSERT INTO user_correct_answers (chat_id, question_id) VALUES (?, ?)", (chat_id, question_id))
+            conn.commit()
+            exp_change = rewards['exp_correct']
+            coin_change = rewards['coins_correct']
+            if room_level == 'Random':
+                exp_change = exp_change * 2
+            add_exp(chat_id, exp_change)
     else:
         exp_change = rewards['exp_wrong']
-        # EXP ni kamaytirish (0 dan pastga tushmasligi kerak)
-        conn2 = sqlite3.connect(DB_PATH)
-        cur2 = conn2.cursor()
-        cur2.execute("UPDATE users SET exp = MAX(0, exp + ?) WHERE chat_id = ?", (exp_change, chat_id))
-        cur2.execute("SELECT exp FROM users WHERE chat_id = ?", (chat_id,))
-        r2 = cur2.fetchone()
+        # EXP kamaytirish
+        cur.execute("UPDATE users SET exp = MAX(0, exp + ?) WHERE chat_id = ?", (exp_change, chat_id))
+        cur.execute("SELECT exp FROM users WHERE chat_id = ?", (chat_id,))
+        r2 = cur.fetchone()
         if r2:
             new_rank = calculate_rank(r2[0])["rank"]
-            cur2.execute("UPDATE users SET rank = ? WHERE chat_id = ?", (new_rank, chat_id))
-        conn2.commit()
-        conn2.close()
+            cur.execute("UPDATE users SET rank = ? WHERE chat_id = ?", (new_rank, chat_id))
+        conn.commit()
+
+    conn.close()
 
     # Savol qiyinligini yangilash
     new_difficulty = shift_difficulty(diff_level, is_correct)
@@ -1562,6 +1661,7 @@ def process_room_answer(chat_id: int, question_id: int, selected_option: str, ro
         "correct_option": correct_opt,
         "exp_change": exp_change,
         "coin_change": coin_change,
+        "already_rewarded": already_rewarded,
         "new_difficulty": new_difficulty,
         "user": user_data,
     }
@@ -1782,13 +1882,20 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         # === API: Foydalanuvchi profili ===
         if parsed.path == "/api/profile":
             chat_id = params.get("chat_id", [None])[0]
+            photo_url = params.get("photo_url", [None])[0]
+            username = params.get("username", [None])[0]
+            full_name = params.get("full_name", [None])[0]
             if chat_id and chat_id.lstrip("-").isdigit():
-                data = get_user_data(int(chat_id))
+                cid = int(chat_id)
+                if username or full_name or photo_url:
+                    get_or_create_user(cid, username=username, full_name=full_name, photo_url=photo_url)
+                data = get_user_data(cid)
                 if data:
                     self._json_response(200, data)
                     return
             self._json_response(404, {"error": "not_found"})
             return
+
 
         # === API: Barcha fonlar ===
         if parsed.path == "/api/backgrounds":
@@ -1875,6 +1982,21 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/subjects":
             subjs = get_all_subjects()
             self._json_response(200, subjs)
+            return
+
+        # === API: Fandagi savollar ro'yxati (preview ko'rinishida) ===
+        if parsed.path == "/api/subject_questions":
+            subject_id = params.get("subject_id", [None])[0]
+            chat_id = params.get("chat_id", [None])[0]
+            if not subject_id:
+                self._json_response(400, {"error": "subject_id required"})
+                return
+            cid = int(chat_id) if chat_id and chat_id.lstrip("-").isdigit() else None
+            data = get_subject_questions_preview(subject_id, cid)
+            if data:
+                self._json_response(200, data)
+            else:
+                self._json_response(404, {"error": "subject_not_found", "message": "Fan topilmadi"})
             return
 
         # === API: Xona uchun random savol ===
